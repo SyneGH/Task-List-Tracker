@@ -1198,7 +1198,7 @@ server <- function(input, output, session) {
       dbDisconnect(db_conn)
     }
   })
-
+  
   # Login logic
   observeEvent(input$login_btn, {
     user <- backend_get_user(db_conn, input$username)
