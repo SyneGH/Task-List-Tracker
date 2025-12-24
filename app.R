@@ -1135,6 +1135,9 @@ ui <- page_fillable(
         const themeToggle = document.querySelector('.theme-toggle');
         const savedTheme = localStorage.getItem('theme') || 'light';
         document.documentElement.setAttribute('data-theme', savedTheme);
+        if (window.Shiny && Shiny.setInputValue) {
+          Shiny.setInputValue('theme_changed', savedTheme, {priority: 'event'});
+        }
         if (switchEl) {
           switchEl.checked = savedTheme === 'dark';
           switchEl.addEventListener('change', function(e) {
@@ -1180,6 +1183,7 @@ server <- function(input, output, session) {
   selected_task <- reactiveVal(NULL)
   tasks_data <- reactiveVal(NULL)
   current_view <- reactiveVal("dashboard")
+  theme_mode <- reactiveVal("light")
 
   onStop(function() {
     if (dbIsValid(db_conn)) {
@@ -1236,6 +1240,12 @@ server <- function(input, output, session) {
     req(logged_in())
     tasks_data(backend_fetch_kanban(db_conn))
   })
+
+  observeEvent(input$theme_changed, {
+    if (!is.null(input$theme_changed) && nzchar(input$theme_changed)) {
+      theme_mode(input$theme_changed)
+    }
+  }, ignoreInit = FALSE)
 
   # Refresh data helper
   refresh_data <- function() {
@@ -1356,17 +1366,19 @@ server <- function(input, output, session) {
           class = "kanban-cards",
           options = sortable_options(
             group = "kanban",
-            onEnd = htmlwidgets::JS(sprintf("
+            onEnd = htmlwidgets::JS(
+              " 
               function(evt) {
                 var taskId = evt.item.getAttribute('data-task-id');
-                var newStatus = '%s';
+                var targetId = (evt.to && evt.to.getAttribute('id')) || '';
+                var newStatus = targetId.replace('rank_', '') || (evt.to && evt.to.dataset.status) || '';
                 Shiny.setInputValue('task_moved', {
                   task_id: taskId,
                   new_status: newStatus,
                   timestamp: new Date().getTime()
                 }, {priority: 'event'});
               }
-            ", col$id))
+            )
           )
         )
       )
@@ -1380,6 +1392,8 @@ server <- function(input, output, session) {
     req(input$task_moved)
     task_id <- as.numeric(input$task_moved$task_id)
     new_status <- input$task_moved$new_status
+
+    req(!is.na(task_id), nzchar(new_status))
 
     # If moved to COMPLETED, mark it
     if (new_status == "COMPLETED") {
@@ -1517,22 +1531,27 @@ server <- function(input, output, session) {
     req(logged_in())
     tasks <- tasks_data()
     req(!is.null(tasks))
-    
+
     status_data <- as.data.frame(table(tasks$status))
     colnames(status_data) <- c("Status", "Count")
-    
-    ggplot(status_data, aes(x = "", y = Count, fill = Status)) +
+
+    text_color <- if (identical(theme_mode(), "dark")) "#e4e6eb" else "#172b4d"
+
+    ggplot(status_data, aes(x = 2, y = Count, fill = Status)) +
       geom_bar(stat = "identity", width = 1) +
       coord_polar("y", start = 0) +
+      xlim(c(0.5, 2.5)) +
       theme_void() +
       theme(
         legend.position = "right",
+        legend.text = element_text(color = text_color),
+        legend.title = element_text(color = text_color),
         plot.background = element_rect(fill = "transparent", color = NA),
         panel.background = element_rect(fill = "transparent", color = NA)
       ) +
       scale_fill_brewer(palette = "Set2")
   })
-  
+
   output$priority_bar <- renderPlot({
     req(logged_in())
     tasks <- tasks_data()
@@ -1540,9 +1559,11 @@ server <- function(input, output, session) {
     
     priority_data <- as.data.frame(table(tasks$priority))
     colnames(priority_data) <- c("Priority", "Count")
-    priority_data$Priority <- factor(priority_data$Priority, 
+    priority_data$Priority <- factor(priority_data$Priority,
                                      levels = c("LOW", "MEDIUM", "HIGH", "CRITICAL"))
-    
+
+    text_color <- if (identical(theme_mode(), "dark")) "#e4e6eb" else "#172b4d"
+
     ggplot(priority_data, aes(x = Priority, y = Count, fill = Priority)) +
       geom_bar(stat = "identity") +
       theme_minimal() +
@@ -1550,7 +1571,10 @@ server <- function(input, output, session) {
         legend.position = "none",
         plot.background = element_rect(fill = "transparent", color = NA),
         panel.background = element_rect(fill = "transparent", color = NA),
-        panel.grid.major.x = element_blank()
+        panel.grid.major.x = element_blank(),
+        text = element_text(color = text_color),
+        axis.title = element_text(color = text_color),
+        axis.text = element_text(color = text_color)
       ) +
       scale_fill_manual(values = c("LOW" = "#28a745", "MEDIUM" = "#ffc107",
                                    "HIGH" = "#fd7e14", "CRITICAL" = "#dc3545"))
@@ -1563,21 +1587,28 @@ server <- function(input, output, session) {
     
     upcoming <- tasks[tasks$status != "COMPLETED" & tasks$due_datetime > Sys.time(), ]
     upcoming <- upcoming[order(upcoming$due_datetime), ]
-    
+
     if (nrow(upcoming) > 0) {
       upcoming <- head(upcoming, 10)
-      
+
+      text_color <- if (identical(theme_mode(), "dark")) "#e4e6eb" else "#172b4d"
+
       ggplot(upcoming, aes(x = due_datetime, y = reorder(title, due_datetime))) +
         geom_point(aes(color = priority), size = 4) +
-        geom_segment(aes(x = Sys.time(), xend = due_datetime, 
-                         y = reorder(title, due_datetime), 
+        geom_segment(aes(x = Sys.time(), xend = due_datetime,
+                         y = reorder(title, due_datetime),
                          yend = reorder(title, due_datetime),
                          color = priority)) +
         theme_minimal() +
         theme(
           legend.position = "bottom",
           plot.background = element_rect(fill = "transparent", color = NA),
-          panel.background = element_rect(fill = "transparent", color = NA)
+          panel.background = element_rect(fill = "transparent", color = NA),
+          text = element_text(color = text_color),
+          axis.title = element_text(color = text_color),
+          axis.text = element_text(color = text_color),
+          legend.text = element_text(color = text_color),
+          legend.title = element_text(color = text_color)
         ) +
         labs(x = "Due Date", y = NULL) +
         scale_color_manual(values = c("LOW" = "#28a745", "MEDIUM" = "#ffc107",
