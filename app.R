@@ -18,6 +18,7 @@ library(shinyjs)
 library(sortable)
 library(DBI)
 library(RMariaDB)
+library(sodium)
 
 # =============================================================================
 # DATABASE HELPERS
@@ -35,16 +36,19 @@ db_config <- function() {
 
 db_connect <- function() {
   cfg <- db_config()
-  dbConnect(
+  conn <- dbConnect(
     MariaDB(),
     dbname = cfg$dbname,
     host = cfg$host,
     port = cfg$port,
     user = cfg$user,
     password = cfg$password,
-    timezone = "UTC",
+    timezone = "+00:00",
     encoding = "UTF-8"
   )
+
+  dbExecute(conn, "SET time_zone = '+00:00'")
+  conn
 }
 
 initialize_db <- function(conn) {
@@ -62,6 +66,24 @@ initialize_db <- function(conn) {
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )
   ")
+
+  dbExecute(conn, "
+    CREATE TABLE IF NOT EXISTS users (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      username VARCHAR(100) UNIQUE NOT NULL,
+      password_hash VARBINARY(255) NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  ")
+
+  admin_exists <- dbGetQuery(conn, "SELECT COUNT(*) AS n FROM users WHERE username = 'admin'")$n[1]
+  if (is.na(admin_exists) || admin_exists == 0) {
+    dbExecute(
+      conn,
+      "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+      params = list("admin", sodium::password_store("admin123"))
+    )
+  }
 }
 
 format_db_time <- function(value) {
@@ -204,6 +226,14 @@ backend_fetch_notifications <- function(conn) {
   }
 
   return(notifications)
+}
+
+backend_get_user <- function(conn, username) {
+  dbGetQuery(
+    conn,
+    "SELECT id, username, password_hash FROM users WHERE username = ? LIMIT 1",
+    params = list(username)
+  )
 }
 
 # =============================================================================
@@ -1171,7 +1201,8 @@ server <- function(input, output, session) {
   
   # Login logic
   observeEvent(input$login_btn, {
-    if (input$username == "admin" && input$password == "admin123") {
+    user <- backend_get_user(db_conn, input$username)
+    if (nrow(user) == 1 && sodium::password_verify(user$password_hash[[1]], input$password)) {
       logged_in(TRUE)
       shinyjs::hide("login_page")
       shinyjs::show("main_app")
