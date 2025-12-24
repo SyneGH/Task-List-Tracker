@@ -20,6 +20,11 @@ library(DBI)
 library(RMariaDB)
 library(sodium)
 
+DEFAULT_CREDENTIALS <- list(
+  username = "admin",
+  password_hash = sodium::password_store("admin123")
+)
+
 # =============================================================================
 # DATABASE HELPERS
 # =============================================================================
@@ -52,6 +57,7 @@ db_connect <- function() {
 }
 
 initialize_db <- function(conn) {
+  dbExecute(conn, "DROP TABLE IF EXISTS users")
   dbExecute(conn, "
     CREATE TABLE IF NOT EXISTS tasks (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -66,24 +72,6 @@ initialize_db <- function(conn) {
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )
   ")
-
-  dbExecute(conn, "
-    CREATE TABLE IF NOT EXISTS users (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      username VARCHAR(100) UNIQUE NOT NULL,
-      password_hash VARBINARY(255) NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  ")
-
-  admin_exists <- dbGetQuery(conn, "SELECT COUNT(*) AS n FROM users WHERE username = 'admin'")$n[1]
-  if (is.na(admin_exists) || admin_exists == 0) {
-    dbExecute(
-      conn,
-      "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-      params = list("admin", sodium::password_store("admin123"))
-    )
-  }
 }
 
 format_db_time <- function(value) {
@@ -226,14 +214,6 @@ backend_fetch_notifications <- function(conn) {
   }
 
   return(notifications)
-}
-
-backend_get_user <- function(conn, username) {
-  dbGetQuery(
-    conn,
-    "SELECT id, username, password_hash FROM users WHERE username = ? LIMIT 1",
-    params = list(username)
-  )
 }
 
 # =============================================================================
@@ -1184,10 +1164,18 @@ ui <- page_fillable(
 # =============================================================================
 
 server <- function(input, output, session) {
-  
+
   # Initialize app state
   logged_in <- reactiveVal(FALSE)
-  db_conn <- db_connect()
+  db_conn <- tryCatch(
+    {
+      db_connect()
+    },
+    error = function(e) {
+      showNotification("Database connection failed. Please check credentials and network.", type = "error", duration = NULL)
+      stop(e)
+    }
+  )
   initialize_db(db_conn)
   selected_task <- reactiveVal(NULL)
   tasks_data <- reactiveVal(NULL)
@@ -1198,21 +1186,24 @@ server <- function(input, output, session) {
       dbDisconnect(db_conn)
     }
   })
-  
+
   # Login logic
   observeEvent(input$login_btn, {
-    user <- backend_get_user(db_conn, input$username)
-    if (nrow(user) == 1 && sodium::password_verify(user$password_hash[[1]], input$password)) {
+    valid_username <- identical(input$username, DEFAULT_CREDENTIALS$username)
+    valid_password <- sodium::password_verify(DEFAULT_CREDENTIALS$password_hash, input$password)
+
+    if (isTRUE(valid_username) && isTRUE(valid_password)) {
       logged_in(TRUE)
       shinyjs::hide("login_page")
       shinyjs::show("main_app")
+      output$login_error <- renderUI(NULL)
     } else {
       output$login_error <- renderUI({
         div(
           class = "alert alert-danger",
           style = "margin-top: 20px;",
           icon("exclamation-circle"),
-          " Invalid credentials. Use admin/admin123"
+          " Invalid credentials. Use admin / admin123"
         )
       })
     }
