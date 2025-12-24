@@ -4,8 +4,8 @@
 # Save this file as: app.R
 # 
 # Dependencies (install before running):
-# install.packages(c("shiny", "bslib", "shinyWidgets", "ggplot2", "dplyr", 
-#                    "htmltools", "shinyjs", "sortable"))
+# install.packages(c("shiny", "bslib", "shinyWidgets", "ggplot2", "dplyr",
+#                    "htmltools", "shinyjs", "sortable", "DBI", "RMariaDB"))
 # ============================================================================
 
 library(shiny)
@@ -16,128 +16,193 @@ library(dplyr)
 library(htmltools)
 library(shinyjs)
 library(sortable)
+library(DBI)
+library(RMariaDB)
 
 # =============================================================================
-# BACKEND PLACEHOLDER FUNCTIONS
+# DATABASE HELPERS
 # =============================================================================
-# REPLACE WITH REAL BACKEND - These use in-memory dummy data for UI testing
 
-init_dummy_data <- function() {
+db_config <- function() {
   list(
-    tasks = data.frame(
-      id = 1:8,
-      title = c("Design homepage mockup", "Implement user authentication", 
-                "Fix critical bug in payment", "Write API documentation",
-                "Code review PR #234", "Database optimization", 
-                "Update dependencies", "Client presentation prep"),
-      description = c("Create wireframes and high-fidelity mockups",
-                      "Setup OAuth and JWT tokens",
-                      "Payment gateway timeout issue",
-                      "REST API endpoints documentation",
-                      "Review security changes",
-                      "Index optimization for queries",
-                      "Update npm packages to latest",
-                      "Prepare Q4 roadmap slides"),
-      priority = c("HIGH", "CRITICAL", "CRITICAL", "MEDIUM", 
-                   "MEDIUM", "HIGH", "LOW", "MEDIUM"),
-      status = c("TODO", "IN_PROGRESS", "OVERDUE", "TODO",
-                 "IN_PROGRESS", "TODO", "COMPLETED", "TODO"),
-      start_datetime = as.POSIXct(c("2025-01-05 09:00", "2025-01-03 10:00",
-                                    "2024-12-20 08:00", "2025-01-10 14:00",
-                                    "2025-01-15 11:00", "2025-01-08 09:00",
-                                    "2025-01-01 10:00", "2025-01-12 13:00")),
-      due_datetime = as.POSIXct(c("2025-01-25 17:00", "2025-01-28 17:00",
-                                  "2024-12-22 17:00", "2025-01-30 17:00",
-                                  "2025-01-20 17:00", "2025-01-26 17:00",
-                                  "2025-01-15 17:00", "2025-01-24 17:00")),
-      completed_at = as.POSIXct(c(NA, NA, NA, NA, NA, NA, "2025-01-14 16:30", NA)),
-      stringsAsFactors = FALSE
-    ),
-    next_id = 9
+    host = Sys.getenv("DB_HOST", "127.0.0.1"),
+    port = as.integer(Sys.getenv("DB_PORT", "3306")),
+    user = Sys.getenv("DB_USER", "root"),
+    password = Sys.getenv("DB_PASSWORD", ""),
+    dbname = "task_list_tracker_system"
   )
 }
 
-backend_fetch_kanban <- function(data_store) {
-  # REPLACE WITH REAL BACKEND: SELECT * FROM tasks
-  tasks <- data_store$tasks
-  tasks$overdue_days <- as.numeric(difftime(Sys.time(), tasks$due_datetime, units = "days"))
-  tasks$overdue_days <- ifelse(tasks$overdue_days < 0, 0, round(tasks$overdue_days))
-  
+db_connect <- function() {
+  cfg <- db_config()
+  dbConnect(
+    MariaDB(),
+    dbname = cfg$dbname,
+    host = cfg$host,
+    port = cfg$port,
+    user = cfg$user,
+    password = cfg$password,
+    timezone = "UTC",
+    encoding = "UTF-8"
+  )
+}
+
+initialize_db <- function(conn) {
+  dbExecute(conn, "
+    CREATE TABLE IF NOT EXISTS tasks (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      title VARCHAR(255) NOT NULL,
+      description TEXT,
+      priority ENUM('LOW','MEDIUM','HIGH','CRITICAL') NOT NULL DEFAULT 'LOW',
+      status ENUM('TODO','IN_PROGRESS','OVERDUE','COMPLETED') NOT NULL DEFAULT 'TODO',
+      start_datetime DATETIME NULL,
+      due_datetime DATETIME NULL,
+      completed_at DATETIME NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )
+  ")
+}
+
+format_db_time <- function(value) {
+  if (is.null(value) || is.na(value)) return(NA)
+  format(as.POSIXct(value, tz = "UTC"), "%Y-%m-%d %H:%M:%S")
+}
+
+backend_fetch_kanban <- function(conn) {
+  tasks <- dbGetQuery(conn, "SELECT id, title, description, priority, status, start_datetime, due_datetime, completed_at FROM tasks ORDER BY id")
+
+  if (nrow(tasks) == 0) {
+    tasks <- data.frame(
+      id = integer(),
+      title = character(),
+      description = character(),
+      priority = character(),
+      status = character(),
+      start_datetime = as.POSIXct(character()),
+      due_datetime = as.POSIXct(character()),
+      completed_at = as.POSIXct(character()),
+      stringsAsFactors = FALSE
+    )
+  } else {
+    tasks$start_datetime <- as.POSIXct(tasks$start_datetime, tz = "UTC")
+    tasks$due_datetime <- as.POSIXct(tasks$due_datetime, tz = "UTC")
+    tasks$completed_at <- as.POSIXct(tasks$completed_at, tz = "UTC")
+  }
+
+  tasks$overdue_days <- ifelse(
+    !is.na(tasks$due_datetime),
+    pmax(0, round(as.numeric(difftime(Sys.time(), tasks$due_datetime, units = "days")))),
+    0
+  )
+
   tasks$ui_column <- ifelse(tasks$status == "TODO", "TODO",
                             ifelse(tasks$status == "IN_PROGRESS", "IN_PROGRESS",
                                    ifelse(tasks$status == "OVERDUE", "OVERDUE", "COMPLETED")))
-  
-  tasks$display_text <- paste0(
-    format(tasks$due_datetime, "%b %d, %I:%M %p"),
-    ifelse(tasks$overdue_days > 0, paste0(" (", tasks$overdue_days, "d overdue)"), "")
+
+  tasks$display_text <- ifelse(
+    is.na(tasks$due_datetime),
+    "No due date",
+    paste0(
+      format(tasks$due_datetime, "%b %d, %I:%M %p"),
+      ifelse(tasks$overdue_days > 0, paste0(" (", tasks$overdue_days, "d overdue)"), "")
+    )
   )
-  
+
   return(tasks)
 }
 
-backend_create_task <- function(data_store, task) {
-  # REPLACE WITH REAL BACKEND: INSERT INTO tasks VALUES (...)
-  new_id <- data_store$next_id
-  new_task <- data.frame(
-    id = new_id,
-    title = task$title,
-    description = task$description,
-    priority = task$priority,
-    status = task$status,
-    start_datetime = as.POSIXct(task$start_datetime),
-    due_datetime = as.POSIXct(task$due_datetime),
-    completed_at = as.POSIXct(NA),
-    stringsAsFactors = FALSE
+backend_get_task <- function(conn, task_id) {
+  task <- dbGetQuery(
+    conn,
+    "SELECT id, title, description, priority, status, start_datetime, due_datetime, completed_at FROM tasks WHERE id = ? LIMIT 1",
+    params = list(task_id)
   )
-  
-  data_store$tasks <- rbind(data_store$tasks, new_task)
-  data_store$next_id <- new_id + 1
-  return(new_task)
-}
 
-backend_update_task <- function(data_store, task_id, updates) {
-  # REPLACE WITH REAL BACKEND: UPDATE tasks SET ... WHERE id = task_id
-  idx <- which(data_store$tasks$id == task_id)
-  if (length(idx) > 0) {
-    for (field in names(updates)) {
-      data_store$tasks[idx, field] <- updates[[field]]
-    }
+  if (nrow(task) > 0) {
+    task$start_datetime <- as.POSIXct(task$start_datetime, tz = "UTC")
+    task$due_datetime <- as.POSIXct(task$due_datetime, tz = "UTC")
+    task$completed_at <- as.POSIXct(task$completed_at, tz = "UTC")
   }
-  return(data_store$tasks[idx, ])
+
+  task
 }
 
-backend_move_task <- function(data_store, task_id, new_status) {
-  # REPLACE WITH REAL BACKEND: UPDATE tasks SET status = new_status WHERE id = task_id
-  backend_update_task(data_store, task_id, list(status = new_status))
+backend_create_task <- function(conn, task) {
+  dbExecute(
+    conn,
+    "INSERT INTO tasks (title, description, priority, status, start_datetime, due_datetime) VALUES (?, ?, ?, ?, ?, ?)",
+    params = list(
+      task$title,
+      task$description,
+      task$priority,
+      task$status,
+      format_db_time(task$start_datetime),
+      format_db_time(task$due_datetime)
+    )
+  )
+
+  new_id <- dbGetQuery(conn, "SELECT LAST_INSERT_ID() AS id")$id[1]
+  backend_get_task(conn, new_id)
 }
 
-backend_mark_completed <- function(data_store, task_id) {
-  # REPLACE WITH REAL BACKEND: UPDATE tasks SET status='COMPLETED', completed_at=NOW() WHERE id = task_id
-  backend_update_task(data_store, task_id, list(
+backend_update_task <- function(conn, task_id, updates) {
+  if (length(updates) == 0) return(NULL)
+
+  updates$updated_at <- Sys.time()
+  update_names <- names(updates)
+  set_clause <- paste(paste0(update_names, " = ?"), collapse = ", ")
+
+  params <- lapply(seq_along(updates), function(i) {
+    name <- update_names[i]
+    value <- updates[[i]]
+    if (name %in% c("start_datetime", "due_datetime", "completed_at", "updated_at")) {
+      return(format_db_time(value))
+    }
+    value
+  })
+
+  params <- c(params, list(task_id))
+
+  dbExecute(
+    conn,
+    paste0("UPDATE tasks SET ", set_clause, " WHERE id = ?"),
+    params = params
+  )
+
+  backend_get_task(conn, task_id)
+}
+
+backend_move_task <- function(conn, task_id, new_status) {
+  backend_update_task(conn, task_id, list(status = new_status))
+}
+
+backend_mark_completed <- function(conn, task_id) {
+  backend_update_task(conn, task_id, list(
     status = "COMPLETED",
     completed_at = Sys.time()
   ))
 }
 
-backend_fetch_notifications <- function(data_store) {
-  # REPLACE WITH REAL BACKEND: SELECT * FROM notifications ORDER BY created_at DESC
-  tasks <- data_store$tasks
+backend_fetch_notifications <- function(conn) {
+  tasks <- backend_fetch_kanban(conn)
   notifications <- c()
-  
+
   overdue <- tasks[tasks$status == "OVERDUE", ]
+  overdue <- overdue[!is.na(overdue$due_datetime), ]
   if (nrow(overdue) > 0) {
-    notifications <- c(notifications, 
-                       paste0("⚠️ Task '", overdue$title, "' is ", 
+    notifications <- c(notifications,
+                       paste0("⚠️ Task '", overdue$title, "' is ",
                               round(as.numeric(difftime(Sys.time(), overdue$due_datetime, units = "days"))),
                               " days overdue"))
   }
-  
+
   critical <- tasks[tasks$priority == "CRITICAL" & tasks$status != "COMPLETED", ]
   if (nrow(critical) > 0) {
     notifications <- c(notifications,
                        paste0("🔴 Critical task: '", critical$title, "'"))
   }
-  
+
   return(notifications)
 }
 
@@ -991,9 +1056,9 @@ ui <- page_fillable(
         div(class = "section-title", "Appearance"),
         div(
           class = "theme-toggle",
-          onclick = "toggleTheme()",
-          div(
+          tags$label(
             class = "theme-toggle-label",
+            `for` = "theme_switch",
             icon("moon"),
             span("Dark Mode")
           ),
@@ -1002,8 +1067,7 @@ ui <- page_fillable(
             tags$input(
               type = "checkbox",
               class = "form-check-input",
-              id = "theme_switch",
-              onclick = "event.stopPropagation();"
+              id = "theme_switch"
             )
           )
         )
@@ -1039,33 +1103,46 @@ ui <- page_fillable(
         document.getElementById('sidebar_overlay').classList.toggle('active');
         document.getElementById('sidebar_menu').classList.toggle('active');
       }
-      
-      function toggleTheme() {
+
+      function toggleTheme(targetTheme) {
         const html = document.documentElement;
-        const currentTheme = html.getAttribute('data-theme');
-        const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+        const switchEl = document.getElementById('theme_switch');
+        const currentTheme = html.getAttribute('data-theme') || 'light';
+        const newTheme = targetTheme || (currentTheme === 'dark' ? 'light' : 'dark');
         html.setAttribute('data-theme', newTheme);
-        document.getElementById('theme_switch').checked = newTheme === 'dark';
+        if (switchEl) {
+          switchEl.checked = newTheme === 'dark';
+        }
         localStorage.setItem('theme', newTheme);
-        
+
         // Notify Shiny
         Shiny.setInputValue('theme_changed', newTheme);
       }
-      
+
       // Load theme on page load
       document.addEventListener('DOMContentLoaded', function() {
+        const switchEl = document.getElementById('theme_switch');
+        const themeToggle = document.querySelector('.theme-toggle');
         const savedTheme = localStorage.getItem('theme') || 'light';
         document.documentElement.setAttribute('data-theme', savedTheme);
-        const switchEl = document.getElementById('theme_switch');
         if (switchEl) {
           switchEl.checked = savedTheme === 'dark';
+          switchEl.addEventListener('change', function(e) {
+            toggleTheme(e.target.checked ? 'dark' : 'light');
+          });
         }
-      });
-      
-      // Handle theme switch click
-      document.addEventListener('click', function(e) {
-        if (e.target.id === 'theme_switch') {
-          toggleTheme();
+
+        if (themeToggle) {
+          themeToggle.addEventListener('click', function(e) {
+            if (e.target.id !== 'theme_switch') {
+              if (switchEl) {
+                switchEl.checked = !switchEl.checked;
+                toggleTheme(switchEl.checked ? 'dark' : 'light');
+              } else {
+                toggleTheme();
+              }
+            }
+          });
         }
       });
     "))
@@ -1080,10 +1157,17 @@ server <- function(input, output, session) {
   
   # Initialize app state
   logged_in <- reactiveVal(FALSE)
-  data_store <- reactiveVal(init_dummy_data())
+  db_conn <- db_connect()
+  initialize_db(db_conn)
   selected_task <- reactiveVal(NULL)
   tasks_data <- reactiveVal(NULL)
   current_view <- reactiveVal("dashboard")
+
+  onStop(function() {
+    if (dbIsValid(db_conn)) {
+      dbDisconnect(db_conn)
+    }
+  })
   
   # Login logic
   observeEvent(input$login_btn, {
@@ -1128,14 +1212,12 @@ server <- function(input, output, session) {
   # Load task data
   observe({
     req(logged_in())
-    tasks_data(backend_fetch_kanban(data_store()))
+    tasks_data(backend_fetch_kanban(db_conn))
   })
-  
+
   # Refresh data helper
   refresh_data <- function() {
-    data <- data_store()
-    data_store(data)
-    tasks_data(backend_fetch_kanban(data_store()))
+    tasks_data(backend_fetch_kanban(db_conn))
   }
   
   # Main content renderer
@@ -1276,16 +1358,14 @@ server <- function(input, output, session) {
     req(input$task_moved)
     task_id <- as.numeric(input$task_moved$task_id)
     new_status <- input$task_moved$new_status
-    
-    data <- data_store()
-    
+
     # If moved to COMPLETED, mark it
     if (new_status == "COMPLETED") {
-      backend_mark_completed(data, task_id)
+      backend_mark_completed(db_conn, task_id)
     } else {
-      backend_move_task(data, task_id, new_status)
+      backend_move_task(db_conn, task_id, new_status)
     }
-    
+
     refresh_data()
   })
   
@@ -1299,10 +1379,9 @@ server <- function(input, output, session) {
         selected_task(tasks[tasks$id == task_id, ])
         showModal(task_modal(tasks[tasks$id == task_id, ], edit = TRUE))
       })
-      
+
       observeEvent(input[[paste0("complete_", task_id)]], {
-        data <- data_store()
-        backend_mark_completed(data, task_id)
+        backend_mark_completed(db_conn, task_id)
         refresh_data()
       })
     })
@@ -1348,15 +1427,21 @@ server <- function(input, output, session) {
       div(
         style = "margin-bottom: 20px;",
         tags$label(class = "form-label", "Start Date/Time"),
-        dateTimeInput("modal_start", NULL,
-                      value = if (edit) task$start_datetime else Sys.time(),
-                      width = "100%")
+        airDatepickerInput(
+          "modal_start", NULL,
+          value = if (edit) task$start_datetime else Sys.time(),
+          timepicker = TRUE,
+          width = "100%"
+        )
       ),
       div(
         tags$label(class = "form-label", "Due Date/Time"),
-        dateTimeInput("modal_due", NULL,
-                      value = if (edit) task$due_datetime else Sys.time() + 86400,
-                      width = "100%")
+        airDatepickerInput(
+          "modal_due", NULL,
+          value = if (edit) task$due_datetime else Sys.time() + 86400,
+          timepicker = TRUE,
+          width = "100%"
+        )
       ),
       
       footer = tagList(
@@ -1377,23 +1462,28 @@ server <- function(input, output, session) {
   
   # Save task
   observeEvent(input$save_task, {
+    parse_datetime <- function(value) {
+      if (inherits(value, "POSIXt")) return(value)
+      if (is.null(value) || is.na(value)) return(NA)
+      as.POSIXct(value)
+    }
+
     task <- list(
       title = input$modal_title,
       description = input$modal_description,
       priority = input$modal_priority,
       status = input$modal_status,
-      start_datetime = input$modal_start,
-      due_datetime = input$modal_due
+      start_datetime = parse_datetime(input$modal_start),
+      due_datetime = parse_datetime(input$modal_due)
     )
     
-    data <- data_store()
     sel_task <- selected_task()
-    
+
     if (!is.null(sel_task)) {
-      backend_update_task(data, sel_task$id, task)
+      backend_update_task(db_conn, sel_task$id, task)
       selected_task(NULL)
     } else {
-      backend_create_task(data, task)
+      backend_create_task(db_conn, task)
     }
     
     refresh_data()
@@ -1497,7 +1587,7 @@ server <- function(input, output, session) {
   # Sidebar notifications
   output$sidebar_notifications <- renderUI({
     req(logged_in())
-    notifications <- backend_fetch_notifications(data_store())
+    notifications <- backend_fetch_notifications(db_conn)
     
     if (length(notifications) > 0) {
       lapply(notifications, function(notif) {
