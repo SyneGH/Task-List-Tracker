@@ -1377,7 +1377,7 @@ server <- function(input, output, session) {
                   new_status: newStatus,
                   timestamp: new Date().getTime()
                 }, {priority: 'event'});
-              }
+              }"
             )
           )
         )
