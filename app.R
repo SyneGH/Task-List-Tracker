@@ -1348,15 +1348,21 @@ server <- function(input, output, session) {
       div(
         style = "margin-bottom: 20px;",
         tags$label(class = "form-label", "Start Date/Time"),
-        dateTimeInput("modal_start", NULL,
-                      value = if (edit) task$start_datetime else Sys.time(),
-                      width = "100%")
+        airDatepickerInput(
+          "modal_start", NULL,
+          value = if (edit) task$start_datetime else Sys.time(),
+          timepicker = TRUE,
+          width = "100%"
+        )
       ),
       div(
         tags$label(class = "form-label", "Due Date/Time"),
-        dateTimeInput("modal_due", NULL,
-                      value = if (edit) task$due_datetime else Sys.time() + 86400,
-                      width = "100%")
+        airDatepickerInput(
+          "modal_due", NULL,
+          value = if (edit) task$due_datetime else Sys.time() + 86400,
+          timepicker = TRUE,
+          width = "100%"
+        )
       ),
       
       footer = tagList(
@@ -1377,13 +1383,19 @@ server <- function(input, output, session) {
   
   # Save task
   observeEvent(input$save_task, {
+    parse_datetime <- function(value) {
+      if (inherits(value, "POSIXt")) return(value)
+      if (is.null(value) || is.na(value)) return(NA)
+      as.POSIXct(value)
+    }
+
     task <- list(
       title = input$modal_title,
       description = input$modal_description,
       priority = input$modal_priority,
       status = input$modal_status,
-      start_datetime = input$modal_start,
-      due_datetime = input$modal_due
+      start_datetime = parse_datetime(input$modal_start),
+      due_datetime = parse_datetime(input$modal_due)
     )
     
     data <- data_store()
