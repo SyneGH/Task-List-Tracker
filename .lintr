@@ -1,0 +1,5 @@
+linters: linters_with_defaults(
+    object_usage_linter = NULL,
+    line_length_linter = linter(length = 120),
+    trailing_whitespace_linter = NULL
+)

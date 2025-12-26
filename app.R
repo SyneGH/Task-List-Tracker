@@ -17,7 +17,8 @@ library(htmltools)
 library(shinyjs)
 library(sortable)
 library(DBI)
-library(RMariaDB)
+# library(RMariaDB)
+library(RPostgres)
 library(sodium)
 
 DEFAULT_CREDENTIALS <- list(
@@ -29,47 +30,64 @@ DEFAULT_CREDENTIALS <- list(
 # DATABASE HELPERS
 # =============================================================================
 
-db_config <- function() {
-  list(
-    host = Sys.getenv("DB_HOST", "127.0.0.1"),
-    port = as.integer(Sys.getenv("DB_PORT", "3306")),
-    user = Sys.getenv("DB_USER", "root"),
-    password = Sys.getenv("DB_PASSWORD", ""),
-    dbname = "task_list_tracker_system"
-  )
-}
-
 db_connect <- function() {
-  cfg <- db_config()
-  conn <- dbConnect(
-    MariaDB(),
-    dbname = cfg$dbname,
-    host = cfg$host,
-    port = cfg$port,
-    user = cfg$user,
-    password = cfg$password,
-    timezone = "+00:00",
-    encoding = "UTF-8"
-  )
+  # Check if we are running locally or on Render
+  # Render always sets the 'RENDER' env var to 'true'
+  is_local <- Sys.getenv("RENDER") == ""
+  
+  db_name <- Sys.getenv("DB_NAME", "task_tracker")
+  db_host <- Sys.getenv("DB_HOST", "127.0.0.1") # Default to localhost
+  db_port <- as.numeric(Sys.getenv("DB_PORT", "5432"))
+  db_user <- Sys.getenv("DB_USER", "postgres")   # Default local superuser
+  db_pass <- Sys.getenv("DB_PASSWORD", "admin123") # Default local password
+  
+  # Local Postgres usually doesn't have SSL set up, but Render REQUIRES it.
+  # "prefer" tries SSL if available, but falls back to plain text (perfect for hybrid).
+  ssl_mode <- if (is_local) "prefer" else "require"
 
-  dbExecute(conn, "SET time_zone = '+00:00'")
+  conn <- dbConnect(
+    RPostgres::Postgres(),
+    dbname = db_name,
+    host = db_host,
+    port = db_port,
+    user = db_user,
+    password = db_pass,
+    sslmode = ssl_mode 
+  )
+  
+  # Postgres handles timezones differently.
+  dbExecute(conn, "SET TIME ZONE 'Asia/Manila'") 
   conn
 }
 
 initialize_db <- function(conn) {
-  dbExecute(conn, "DROP TABLE IF EXISTS users")
+  # Drop tables if you need a clean slate (Be careful in production!)
+  # dbExecute(conn, "DROP TABLE IF EXISTS notifications")
+  # dbExecute(conn, "DROP TABLE IF EXISTS tasks")
+
   dbExecute(conn, "
     CREATE TABLE IF NOT EXISTS tasks (
-      id INT AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       title VARCHAR(255) NOT NULL,
       description TEXT,
-      priority ENUM('LOW','MEDIUM','HIGH','CRITICAL') NOT NULL DEFAULT 'LOW',
-      status ENUM('TODO','IN_PROGRESS','OVERDUE','COMPLETED') NOT NULL DEFAULT 'TODO',
-      start_datetime DATETIME NULL,
-      due_datetime DATETIME NULL,
-      completed_at DATETIME NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      priority TEXT NOT NULL DEFAULT 'LOW' CHECK (priority IN ('LOW','MEDIUM','HIGH','CRITICAL')),
+      status TEXT NOT NULL DEFAULT 'TODO' CHECK (status IN ('TODO','IN_PROGRESS','OVERDUE','COMPLETED')),
+      start_datetime TIMESTAMP NULL,
+      due_datetime TIMESTAMP NULL,
+      completed_at TIMESTAMP NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  ")
+
+  dbExecute(conn, "
+    CREATE TABLE IF NOT EXISTS notifications (
+      id SERIAL PRIMARY KEY,
+      task_id INT,
+      message TEXT NOT NULL,
+      is_read BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
     )
   ")
 }
@@ -95,9 +113,9 @@ backend_fetch_kanban <- function(conn) {
       stringsAsFactors = FALSE
     )
   } else {
-    tasks$start_datetime <- as.POSIXct(tasks$start_datetime, tz = "UTC")
-    tasks$due_datetime <- as.POSIXct(tasks$due_datetime, tz = "UTC")
-    tasks$completed_at <- as.POSIXct(tasks$completed_at, tz = "UTC")
+    tasks$start_datetime <- lubridate::with_tz(as.POSIXct(tasks$start_datetime, tz = "UTC"), "Asia/Manila")
+    tasks$due_datetime   <- lubridate::with_tz(as.POSIXct(tasks$due_datetime, tz = "UTC"), "Asia/Manila")
+    tasks$completed_at   <- lubridate::with_tz(as.POSIXct(tasks$completed_at, tz = "UTC"), "Asia/Manila")
   }
 
   tasks$overdue_days <- ifelse(
@@ -125,34 +143,41 @@ backend_fetch_kanban <- function(conn) {
 backend_get_task <- function(conn, task_id) {
   task <- dbGetQuery(
     conn,
-    "SELECT id, title, description, priority, status, start_datetime, due_datetime, completed_at FROM tasks WHERE id = ? LIMIT 1",
+    "SELECT id, title, description, priority, status, start_datetime, due_datetime, completed_at FROM tasks WHERE id = $1 LIMIT 1",
     params = list(task_id)
   )
 
+  # ... rest of function remains the same ...
   if (nrow(task) > 0) {
     task$start_datetime <- as.POSIXct(task$start_datetime, tz = "UTC")
     task$due_datetime <- as.POSIXct(task$due_datetime, tz = "UTC")
     task$completed_at <- as.POSIXct(task$completed_at, tz = "UTC")
   }
-
   task
 }
 
 backend_create_task <- function(conn, task) {
-  dbExecute(
-    conn,
-    "INSERT INTO tasks (title, description, priority, status, start_datetime, due_datetime) VALUES (?, ?, ?, ?, ?, ?)",
-    params = list(
-      task$title,
-      task$description,
-      task$priority,
-      task$status,
-      format_db_time(task$start_datetime),
-      format_db_time(task$due_datetime)
-    )
-  )
-
-  new_id <- dbGetQuery(conn, "SELECT LAST_INSERT_ID() AS id")$id[1]
+  # 1. Prepare SQL with $n placeholders and RETURNING id
+  sql <- "
+    INSERT INTO tasks (title, description, priority, status, start_datetime, due_datetime) 
+    VALUES ($1, $2, $3, $4, $5, $6)
+    RETURNING id
+  "
+  
+  # 2. Execute and get the ID in one step
+  # Note: dbGetQuery is used here because we expect a return value (the ID)
+  result <- dbGetQuery(conn, sql, params = list(
+    task$title,
+    task$description,
+    task$priority,
+    task$status,
+    format_db_time(task$start_datetime),
+    format_db_time(task$due_datetime)
+  ))
+  
+  new_id <- result$id
+  
+  # 3. Return the full task
   backend_get_task(conn, new_id)
 }
 
@@ -161,7 +186,14 @@ backend_update_task <- function(conn, task_id, updates) {
 
   updates$updated_at <- Sys.time()
   update_names <- names(updates)
-  set_clause <- paste(paste0(update_names, " = ?"), collapse = ", ")
+  
+  # FIX: Create $1, $2, $3 placeholders dynamically
+  # example: "title = $1, status = $2"
+  placeholders <- paste0(update_names, " = $", seq_along(update_names))
+  set_clause <- paste(placeholders, collapse = ", ")
+  
+  # The WHERE clause needs the next available number (e.g., $3)
+  id_placeholder <- paste0("$", length(updates) + 1)
 
   params <- lapply(seq_along(updates), function(i) {
     name <- update_names[i]
@@ -176,7 +208,7 @@ backend_update_task <- function(conn, task_id, updates) {
 
   dbExecute(
     conn,
-    paste0("UPDATE tasks SET ", set_clause, " WHERE id = ?"),
+    paste0("UPDATE tasks SET ", set_clause, " WHERE id = ", id_placeholder),
     params = params
   )
 
@@ -195,25 +227,82 @@ backend_mark_completed <- function(conn, task_id) {
 }
 
 backend_fetch_notifications <- function(conn) {
-  tasks <- backend_fetch_kanban(conn)
-  notifications <- c()
-
-  overdue <- tasks[tasks$status == "OVERDUE", ]
-  overdue <- overdue[!is.na(overdue$due_datetime), ]
-  if (nrow(overdue) > 0) {
-    notifications <- c(notifications,
-                       paste0("⚠️ Task '", overdue$title, "' is ",
-                              round(as.numeric(difftime(Sys.time(), overdue$due_datetime, units = "days"))),
-                              " days overdue"))
+  res <- dbGetQuery(conn, "
+    SELECT id, message, created_at 
+    FROM notifications 
+    WHERE is_read = FALSE 
+    ORDER BY created_at DESC
+  ")
+  
+  if (nrow(res) > 0) {
+    return(res$message)
+  } else {
+    return(character(0))
   }
+}
 
-  critical <- tasks[tasks$priority == "CRITICAL" & tasks$status != "COMPLETED", ]
-  if (nrow(critical) > 0) {
-    notifications <- c(notifications,
-                       paste0("🔴 Critical task: '", critical$title, "'"))
-  }
+backend_clear_notifications <- function(conn) {
+  dbExecute(conn, "UPDATE notifications SET is_read = TRUE WHERE is_read = FALSE")
+}
 
-  return(notifications)
+backend_check_overdue <- function(conn) {
+  
+  # 1. WARNING: 24 HOURS BEFORE (Range: 6h to 24h)
+  # Prevents triggering if the task is already super urgent (e.g. due in 1 hour)
+  dbExecute(conn, "
+    INSERT INTO notifications (task_id, message)
+    SELECT id, CONCAT('⏳ Task \"', title, '\" is due in 24 hours')
+    FROM tasks
+    WHERE status IN ('TODO', 'IN_PROGRESS')
+    AND due_datetime > NOW() AT TIME ZONE 'UTC' + INTERVAL '6 hours'
+    AND due_datetime <= NOW() AT TIME ZONE 'UTC' + INTERVAL '1 day'
+    AND id NOT IN (SELECT task_id FROM notifications WHERE message LIKE '%due in 24 hours%')
+  ")
+
+  # 2. WARNING: 6 HOURS BEFORE (Range: 30m to 6h)
+  dbExecute(conn, "
+    INSERT INTO notifications (task_id, message)
+    SELECT id, CONCAT('⏰ Task \"', title, '\" is due in 6 hours')
+    FROM tasks
+    WHERE status IN ('TODO', 'IN_PROGRESS')
+    AND due_datetime > NOW() AT TIME ZONE 'UTC' + INTERVAL '30 minutes'
+    AND due_datetime <= NOW() AT TIME ZONE 'UTC' + INTERVAL '6 hours'
+    AND id NOT IN (SELECT task_id FROM notifications WHERE message LIKE '%due in 6 hours%')
+  ")
+
+  # 3. WARNING: 30 MINUTES BEFORE (Range: Now to 30m)
+  dbExecute(conn, "
+    INSERT INTO notifications (task_id, message)
+    SELECT id, CONCAT('🔥 Task \"', title, '\" is due in < 30 minutes!')
+    FROM tasks
+    WHERE status IN ('TODO', 'IN_PROGRESS')
+    AND due_datetime > NOW() AT TIME ZONE 'UTC'
+    AND due_datetime <= NOW() AT TIME ZONE 'UTC' + INTERVAL '30 minutes'
+    AND id NOT IN (SELECT task_id FROM notifications WHERE message LIKE '%due in < 30 minutes%')
+  ")
+
+  # 4. ACTION: MARK OVERDUE (0 Seconds)
+  # First, update the status
+  dbExecute(conn, "
+    UPDATE tasks 
+    SET status = 'OVERDUE' 
+    WHERE due_datetime < NOW() AT TIME ZONE 'UTC' 
+    AND status IN ('TODO', 'IN_PROGRESS')
+  ")
+
+  # Second, send the notification for the status change
+  dbExecute(conn, "
+    INSERT INTO notifications (task_id, message)
+    SELECT id, CONCAT('⚠️ Task \"', title, '\" is now overdue')
+    FROM tasks
+    WHERE status = 'OVERDUE'
+    AND id NOT IN (SELECT task_id FROM notifications WHERE message LIKE '%now overdue%')
+  ")
+}
+
+backend_delete_task <- function(conn, task_id) {
+  # Cascading delete handles notifications automatically via SQL schema
+  dbExecute(conn, "DELETE FROM tasks WHERE id = $1", params = list(task_id))
 }
 
 # =============================================================================
@@ -228,28 +317,31 @@ create_task_card <- function(task, ns) {
     CRITICAL = list(bg = "#ffebe6", text = "#de350b", border = "#de350b")
   )
   
-  priority_style <- priority_colors[[task$priority]]
-  
+  p_style <- priority_colors[[task$priority]]
+  if (is.null(p_style)) p_style <- priority_colors$LOW
+
   div(
     class = "task-card sortable-item",
     `data-task-id` = task$id,
     id = paste0("task_", task$id),
     
+    # Drag Handle
+    div(class = "drag-handle", icon("grip-vertical")),
+    
     div(
-      style = "margin-bottom: 12px;",
-      div(
-        class = "task-title",
-        task$title
-      ),
+      style = "margin-bottom: 8px; padding-right: 20px;",
+      div(class = "task-title", task$title),
       span(
         class = "priority-badge",
-        style = sprintf(
-          "background: %s; color: %s; border-color: %s;",
-          priority_style$bg, priority_style$text, priority_style$border
-        ),
+        style = sprintf("background: %s; color: %s; border-color: %s;",
+                        p_style$bg, p_style$text, p_style$border),
         task$priority
       )
     ),
+    
+    if (!is.na(task$description) && task$description != "") {
+      div(class = "task-description", task$description)
+    },
     
     div(
       class = "task-meta",
@@ -259,20 +351,30 @@ create_task_card <- function(task, ns) {
     
     div(
       class = "task-actions",
-      actionButton(
-        ns(paste0("edit_", task$id)),
-        "Edit",
-        class = "btn-task-action",
-        onclick = "event.stopPropagation();"
+      # 1. Edit Button
+      tags$button(
+        class = "btn btn-task-action",
+        type = "button",
+        onclick = sprintf("event.stopPropagation(); Shiny.setInputValue('%s', %d, {priority: 'event'});", ns("trigger_edit_task"), task$id),
+        "Edit"
       ),
+      # 2. Complete Button (Only if not completed)
       if (task$status != "COMPLETED") {
-        actionButton(
-          ns(paste0("complete_", task$id)),
-          HTML('<i class="fa fa-check"></i>'),
-          class = "btn-task-complete",
-          onclick = "event.stopPropagation();"
+        tags$button(
+          class = "btn btn-task-complete",
+          type = "button",
+          onclick = sprintf("event.stopPropagation(); Shiny.setInputValue('%s', %d, {priority: 'event'});", ns("trigger_complete_task"), task$id),
+          HTML('<i class="fa fa-check"></i>')
         )
-      }
+      },
+      # 3. Delete Button
+      tags$button(
+        class = "btn btn-task-delete",
+        type = "button",
+        title = "Delete Task",
+        onclick = sprintf("event.stopPropagation(); Shiny.setInputValue('%s', %d, {priority: 'event'});", ns("trigger_delete_task"), task$id),
+        icon("trash")
+      )
     )
   )
 }
@@ -507,6 +609,64 @@ ui <- page_fillable(
         background: var(--bg-tertiary);
       }
       
+      /* === NAVBAR RIGHT === */
+      .navbar-right {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+      }
+
+      .nav-icon-btn {
+        background: transparent;
+        border: none;
+        color: var(--text-secondary);
+        font-size: 20px;
+        padding: 8px;
+        border-radius: 50%;
+        cursor: pointer;
+        transition: all 0.2s;
+        position: relative; /* For badge positioning */
+      }
+
+      .nav-icon-btn:hover {
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+      }
+
+      /* Notification Badge (Red Dot) */
+      .notif-badge {
+        position: absolute;
+        top: 4px;
+        right: 4px;
+        width: 10px;
+        height: 10px;
+        background: #de350b;
+        border-radius: 50%;
+        border: 2px solid var(--bg-secondary);
+      }
+
+      /* Popover/Dropdown Styling */
+      .popover {
+        border: 1px solid var(--border-color);
+        box-shadow: var(--shadow-lg);
+        background: var(--bg-secondary);
+        max-width: 350px;
+        z-index: 1060;
+      }
+      
+      .popover-header {
+        background: var(--bg-secondary);
+        border-bottom: 1px solid var(--border-color);
+        color: var(--text-primary);
+        font-weight: 700;
+      }
+      
+      .popover-body {
+        padding: 0;
+        background: var(--bg-secondary);
+        color: var(--text-primary);
+      }
+
       /* === SIDEBAR MENU === */
       .sidebar-overlay {
         position: fixed;
@@ -750,10 +910,13 @@ ui <- page_fillable(
         overflow-x: auto;
         padding: 4px;
         height: calc(100vh - 280px);
+        align-items: flex-start;
       }
       
       .kanban-column {
-        flex: 0 0 320px;
+        flex: 1 1 0;
+        min-width: 0;
+
         background: var(--bg-secondary);
         border-radius: 12px;
         padding: 16px;
@@ -761,6 +924,7 @@ ui <- page_fillable(
         flex-direction: column;
         border: 1px solid var(--border-color);
         box-shadow: var(--shadow-sm);
+        height: 100%;
       }
       
       .kanban-column-header {
@@ -819,17 +983,18 @@ ui <- page_fillable(
       .task-card {
         background: var(--bg-secondary);
         border-radius: 8px;
-        padding: 16px;
+        padding: 12px 16px; /* Adjusted padding */
         margin-bottom: 12px;
         box-shadow: var(--shadow-sm);
-        cursor: grab;
         border: 1px solid var(--border-color);
         transition: all 0.2s;
+        position: relative; /* Needed for handle positioning */
+        max-width: 100%;
       }
       
       .task-card:hover {
         box-shadow: var(--shadow-md);
-        transform: translateY(-2px);
+        border-color: var(--accent);
       }
       
       .task-card:active {
@@ -852,15 +1017,41 @@ ui <- page_fillable(
         color: var(--text-primary);
         margin-bottom: 8px;
         line-height: 1.4;
+
+        /* Truncation Logic */
+        display: -webkit-box;
+        -webkit-line-clamp: 2;        /* Show max 2 lines */
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        word-break: break-all;       /* FORCE break long words like 'aaaaa' */
+        overflow-wrap: anywhere;
+      }
+
+      .task-description {
+        font-size: 13px;
+        color: var(--text-secondary);
+        margin-bottom: 12px;
+
+        display: -webkit-box;
+        -webkit-line-clamp: 2; /* Show max 2 lines */
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        word-break: break-all;       /* FORCE break long words like 'aaaaa' */
+        overflow-wrap: anywhere;
+        line-height: 1.4;
       }
       
       .priority-badge {
         display: inline-block;
-        padding: 4px 10px;
-        border-radius: 12px;
+        padding: 2px 8px;
+        border-radius: 4px;
         font-size: 11px;
-        font-weight: 600;
-        border: 1px solid;
+        font-weight: 700;
+        border: 1px solid transparent;
+        text-transform: uppercase;
+        margin-top: 4px;
       }
       
       .task-meta {
@@ -879,6 +1070,7 @@ ui <- page_fillable(
       }
       
       .btn-task-action {
+        display: inline-block;
         padding: 6px 14px;
         font-size: 13px;
         border-radius: 6px;
@@ -911,13 +1103,61 @@ ui <- page_fillable(
         background: #006644;
         transform: translateY(-1px);
       }
+
+      .btn-task-delete {
+        padding: 6px 14px;
+        font-size: 13px;
+        border-radius: 6px;
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        color: var(--text-tertiary); /* Muted color by default */
+        font-weight: 500;
+        transition: all 0.2s;
+        cursor: pointer;
+      }
+      
+      .btn-task-delete:hover {
+        background: #ffebe6;
+        border-color: #ffbdad;
+        color: #de350b; /* Red on hover */
+      }
+      
+      /* === DRAG HANDLE === */
+      .drag-handle {
+        cursor: grab;
+        color: var(--text-tertiary);
+        padding: 4px 8px;
+        position: absolute;
+        top: 12px;
+        right: 12px;
+        font-size: 14px;
+        border-radius: 4px;
+      }
+      
+      .drag-handle:hover {
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+      }
+      
+      .drag-handle:active {
+        cursor: grabbing;
+      }
       
       /* === MODAL === */
+      .modal {
+        z-index: 1050 !important; 
+      }
+
+      .modal-backdrop {
+        z-index: 1040 !important;
+      }
+
       .modal-content {
         border-radius: 12px;
-        border: none;
-        box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+        border: 1px solid var(--border-color);
+        box-shadow: 0 20px 50px rgba(0,0,0,0.3) !important; /* Stronger, cleaner shadow */
         background: var(--bg-secondary);
+        background-clip: padding-box; /* Ensures background doesn't bleed */
       }
       
       .modal-header {
@@ -942,6 +1182,11 @@ ui <- page_fillable(
         padding: 20px 28px;
         background: var(--bg-secondary);
       }
+
+      .modal-dialog {
+        /* Fixes the ghosting artifact */
+        box-shadow: none !important; 
+      }
       
       .btn-secondary {
         background: var(--bg-tertiary);
@@ -957,6 +1202,23 @@ ui <- page_fillable(
         background: var(--bg-primary);
         border-color: var(--text-tertiary);
         color: var(--text-primary);
+      }
+
+      /* === MODAL DELETE BUTTON === */
+      .btn-modal-delete {
+        background-color: #de350b; /* Red */
+        border-color: #de350b;
+        color: white;
+        font-weight: 600;
+        transition: all 0.2s; /* This enables the animation */
+      }
+      
+      .btn-modal-delete:hover {
+        background-color: #bf2600 !important; /* Darker Red on hover */
+        border-color: #bf2600 !important;
+        transform: translateY(-1px);          /* Slight lift effect */
+        box-shadow: 0 4px 8px rgba(222, 53, 11, 0.3); /* Red glow */
+        color: white;
       }
       
       /* === ALERTS === */
@@ -984,6 +1246,43 @@ ui <- page_fillable(
       .form-switch .form-check-input:checked {
         background-color: var(--accent);
         border-color: var(--accent);
+      }
+
+      .air-datepicker-global-container {
+        z-index: 1060 !important; /* Higher than modal (1050) */
+      }
+      
+      /* Ensure the input wrapper doesn't clip the popup */
+      .air-datepicker-cell.-selected- {
+        background: var(--accent) !important;
+      }
+
+      /* === MODERN SCROLLBAR (Global) === */
+      /* Works on Chrome, Edge, Safari */
+      ::-webkit-scrollbar {
+        width: 6px;               /* Vertical scrollbar width */
+        height: 6px;              /* Horizontal scrollbar height */
+      }
+
+      ::-webkit-scrollbar-track {
+        background: transparent;  /* Transparent track */
+      }
+
+      ::-webkit-scrollbar-thumb {
+        background-color: #dfe1e6; /* Light gray handle */
+        border-radius: 20px;       /* Fully rounded corners */
+        border: 2px solid transparent; /* padding around scroll thumb */
+        background-clip: content-box;  /* makes the scrollbar look thinner */
+      }
+
+      ::-webkit-scrollbar-thumb:hover {
+        background-color: #c1c7d0; /* Darker on hover */
+      }
+
+      /* Works on Firefox */
+      * {
+        scrollbar-width: thin;
+        scrollbar-color: #dfe1e6 transparent;
       }
     "))
   ),
@@ -1020,9 +1319,11 @@ ui <- page_fillable(
     id = "main_app",
     style = "display: none;",
     
-    # Navbar
+# Navbar
     div(
       class = "app-navbar",
+      
+      # LEFT: Logo and Tabs
       div(
         class = "navbar-left",
         div(
@@ -1036,10 +1337,51 @@ ui <- page_fillable(
           actionButton("nav_tasks", "Tasks", class = "nav-link")
         )
       ),
-      tags$button(
-        class = "hamburger-btn",
-        onclick = "toggleSidebar()",
-        icon("bars")
+      
+      # RIGHT: Icons (Dark Mode, Notifs, Logout)
+      div(
+        class = "navbar-right",
+        
+        # 1. Dark Mode Toggle
+        tags$button(
+          id = "theme_toggle_btn",
+          class = "nav-icon-btn",
+          onclick = "toggleTheme()", # Reusing your existing JS function
+          icon("moon")
+        ),
+        
+        # 2. Notifications (Uses bslib popover)
+        popover(
+          trigger = tags$button(
+            class = "nav-icon-btn",
+            icon("bell"),
+            # Dynamic UI for the red dot badge
+            uiOutput("notif_badge_indicator", inline = TRUE)
+          ),
+          title = "Notifications",
+          placement = "bottom",
+          
+          # Content inside the popover
+          div(
+            class = "notification-list",
+            style = "max-height: 300px; overflow-y: auto; padding: 12px;",
+            uiOutput("navbar_notifications") # Renamed from sidebar_notifications
+          ),
+          div(
+            style = "padding: 12px; border-top: 1px solid var(--border-color); text-align: center;",
+            actionButton("clear_notifications", "Mark all read", 
+                         class = "btn-task-action w-100")
+          )
+        ),
+        
+        # 3. Logout
+        tags$button(
+          id = "logout_btn",
+          class = "nav-icon-btn",
+          onclick = "Shiny.setInputValue('logout', Math.random());",
+          icon("sign-out-alt"),
+          title = "Logout"
+        )
       )
     ),
     
@@ -1158,6 +1500,43 @@ ui <- page_fillable(
           });
         }
       });
+
+      /* === NEW: SESSION COOKIE MANAGEMENT === */
+      
+      // 1. Function to Set a Cookie (Login)
+      function setCookie(name, value, days) {
+        var expires = '';
+        if (days) {
+          var date = new Date();
+          date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
+          expires = '; expires=' + date.toUTCString();
+        }
+        document.cookie = name + '=' + (value || '') + expires + '; path=/';
+      }
+
+      // 2. Function to Get a Cookie (Auto-Login)
+      function getCookie(name) {
+        var nameEQ = name + '=';
+        var ca = document.cookie.split(';');
+        for(var i=0;i < ca.length;i++) {
+          var c = ca[i];
+          while (c.charAt(0)==' ') c = c.substring(1,c.length);
+          if (c.indexOf(nameEQ) == 0) return c.substring(nameEQ.length,c.length);
+        }
+        return null;
+      }
+
+      // 3. Function to Delete Cookie (Logout)
+      function deleteCookie(name) {
+        document.cookie = name + '=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;';
+      }
+
+      // 4. Send Cookie to Shiny on Connection
+      $(document).on('shiny:connected', function() {
+        var savedUser = getCookie('task_tracker_user');
+        // Send this value to R as input$saved_user
+        Shiny.setInputValue('saved_user', savedUser);
+      });
     "))
   )
 )
@@ -1167,6 +1546,20 @@ ui <- page_fillable(
 # =============================================================================
 
 server <- function(input, output, session) {
+
+  # --- AUTO-LOGIN LOGIC ---
+  observeEvent(input$saved_user, {
+    # Only run if we aren't already logged in
+    req(!logged_in())
+    
+    # Check if the cookie contains our valid user (In production, use a secure token!)
+    if (!is.null(input$saved_user) && input$saved_user == "admin") {
+      logged_in(TRUE)
+      shinyjs::hide("login_page")
+      shinyjs::show("main_app")
+      showNotification("Welcome back!", type = "message")
+    }
+  })
 
   # Initialize app state
   logged_in <- reactiveVal(FALSE)
@@ -1198,6 +1591,10 @@ server <- function(input, output, session) {
 
     if (isTRUE(valid_username) && isTRUE(valid_password)) {
       logged_in(TRUE)
+      
+      # Save session cookie for 7 days
+      shinyjs::runjs(sprintf("setCookie('task_tracker_user', '%s', 7);", input$username))
+
       shinyjs::hide("login_page")
       shinyjs::show("main_app")
       output$login_error <- renderUI(NULL)
@@ -1216,6 +1613,10 @@ server <- function(input, output, session) {
   # Logout
   observeEvent(input$logout, {
     logged_in(FALSE)
+
+    # Delete the session cookie
+    shinyjs::runjs("deleteCookie('task_tracker_user');")
+
     shinyjs::show("login_page")
     shinyjs::hide("main_app")
     updateTextInput(session, "username", value = "")
@@ -1235,9 +1636,37 @@ server <- function(input, output, session) {
     shinyjs::removeClass(id = "nav_dashboard", class = "active")
   })
   
-  # Load task data
+  # ===========================================================================
+  # 1. POLLING TIMERS (The "Heartbeat" of the App)
+  # ===========================================================================
+  
+  # Fast Timer (Every 2 seconds): Checks for new notifications
+  fast_poll <- reactiveTimer(2000)
+  
+  # Slow Timer (Every 30 seconds): Checks for overdue tasks & updates board
+  # We do this less often so cards don't "jump" while you are dragging them
+  slow_poll <- reactiveTimer(30000)
+
+  # ===========================================================================
+  # 2. AUTO-REFRESH LOGIC
+  # ===========================================================================
+
+  # MAIN DATA LOOP (Runs every 60s OR when manually refreshed)
   observe({
     req(logged_in())
+    
+    # Trigger 1: The 60-second timer
+    slow_poll()
+    
+    # Trigger 2: Manual refresh (via the helper function)
+    # Note: We don't need to explicitly list it here because 'refresh_data'
+    # updates 'tasks_data' directly, but we do need to run the checks.
+    
+    # A. Check for overdue tasks (Background Worker Simulation)
+    # This ensures statuses flip to "OVERDUE" even if you just sit there.
+    backend_check_overdue(db_conn)
+    
+    # B. Fetch the fresh data for the Kanban board
     tasks_data(backend_fetch_kanban(db_conn))
   })
 
@@ -1346,19 +1775,23 @@ server <- function(input, output, session) {
         })
       } else {
         list(div(
-          class = "empty-column",
-          icon("inbox", style = "font-size: 32px; margin-bottom: 8px; display: block;"),
-          "Drop tasks here"
+          class = "empty-placeholder",
+          style = "height: 50px; border: 1px dashed #ccc; border-radius: 8px; margin-bottom: 8px; display: flex; align-items: center; justify-content: center; color: #999;",
+          "Drop here"
         ))
       }
       
       div(
         class = "kanban-column",
+        id = paste0("col_", col$id),
+        `data-status` = col$id,
+        
         div(
           class = "kanban-column-header",
           span(col$name),
           span(class = "column-count-badge", nrow(col_tasks))
         ),
+        
         rank_list(
           text = NULL,
           labels = card_list,
@@ -1366,19 +1799,41 @@ server <- function(input, output, session) {
           class = "kanban-cards",
           options = sortable_options(
             group = "kanban",
-            onEnd = htmlwidgets::JS(
-              " 
+            handle = ".drag-handle",
+            onEnd = htmlwidgets::JS("
               function(evt) {
-                var taskId = evt.item.getAttribute('data-task-id');
-                var targetId = (evt.to && evt.to.getAttribute('id')) || '';
-                var newStatus = targetId.replace('rank_', '') || (evt.to && evt.to.dataset.status) || '';
-                Shiny.setInputValue('task_moved', {
-                  task_id: taskId,
-                  new_status: newStatus,
-                  timestamp: new Date().getTime()
-                }, {priority: 'event'});
-              }"
-            )
+                var itemEl = evt.item;
+                
+                // --- ROBUST ID LOOKUP ---
+                // 1. Try to get ID from the dragged element itself
+                var taskId = itemEl.getAttribute('data-task-id');
+                
+                // 2. If not found, sortable might have wrapped it. 
+                //    Look for the ID inside the children.
+                if (!taskId) {
+                   var innerCard = itemEl.querySelector('.task-card');
+                   if (innerCard) {
+                     taskId = innerCard.getAttribute('data-task-id');
+                   }
+                }
+                // ------------------------
+
+                // Find the new status from the column wrapper
+                var dropTarget = evt.to; 
+                var columnWrapper = dropTarget.closest('.kanban-column');
+                var newStatus = columnWrapper ? columnWrapper.getAttribute('data-status') : null;
+                
+                console.log('Moved Task:', taskId, 'To Status:', newStatus);
+
+                if (taskId && newStatus) {
+                  Shiny.setInputValue('task_moved', {
+                    task_id: taskId,
+                    new_status: newStatus,
+                    timestamp: new Date().getTime()
+                  }, {priority: 'event'});
+                }
+              }
+            ")
           )
         )
       )
@@ -1406,21 +1861,29 @@ server <- function(input, output, session) {
   })
   
   # Task selection and actions
-  observe({
+  # --- NEW: Single Observer for Edit Actions ---
+  observeEvent(input$trigger_edit_task, {
+    task_id <- input$trigger_edit_task
     tasks <- tasks_data()
-    req(!is.null(tasks))
     
-    lapply(tasks$id, function(task_id) {
-      observeEvent(input[[paste0("edit_", task_id)]], {
-        selected_task(tasks[tasks$id == task_id, ])
-        showModal(task_modal(tasks[tasks$id == task_id, ], edit = TRUE))
-      })
+    # Find the specific task from the current data
+    task <- tasks[tasks$id == task_id, ]
+    
+    if (nrow(task) > 0) {
+      selected_task(task)
+      showModal(task_modal(task, edit = TRUE))
+    }
+  })
 
-      observeEvent(input[[paste0("complete_", task_id)]], {
-        backend_mark_completed(db_conn, task_id)
-        refresh_data()
-      })
-    })
+  # --- NEW: Single Observer for Complete Actions ---
+  observeEvent(input$trigger_complete_task, {
+    task_id <- input$trigger_complete_task
+    
+    # Run the database update
+    backend_mark_completed(db_conn, task_id)
+    
+    # Refresh the UI
+    refresh_data()
   })
   
   # Task modal
@@ -1467,7 +1930,8 @@ server <- function(input, output, session) {
           "modal_start", NULL,
           value = if (edit) task$start_datetime else Sys.time(),
           timepicker = TRUE,
-          width = "100%"
+          width = "100%",
+          position = "top right"
         )
       ),
       div(
@@ -1476,11 +1940,20 @@ server <- function(input, output, session) {
           "modal_due", NULL,
           value = if (edit) task$due_datetime else Sys.time() + 86400,
           timepicker = TRUE,
-          width = "100%"
+          width = "100%",
+          position = "top right"
         )
       ),
       
       footer = tagList(
+        if (edit) {
+          div(
+            style = "float: left;",
+            # CHANGE: Removed inline style, added 'btn-modal-delete' class
+            actionButton("delete_task_modal", "Delete", icon = icon("trash"), 
+                         class = "btn-danger btn-modal-delete")
+          )
+        },
         actionButton("modal_cancel", "Cancel", class = "btn-secondary"),
         actionButton("save_task", "Save Task", class = "btn-primary")
       )
@@ -1532,89 +2005,131 @@ server <- function(input, output, session) {
     tasks <- tasks_data()
     req(!is.null(tasks))
 
+    if (nrow(tasks) == 0) {
+      return(ggplot() + 
+               annotate("text", x = 1, y = 1, label = "No tasks yet", size = 6, color = "#8993a4") + 
+               theme_void())
+    }
+
     status_data <- as.data.frame(table(tasks$status))
+    if (ncol(status_data) < 2) colnames(status_data) <- c("Var1", "Freq")
     colnames(status_data) <- c("Status", "Count")
 
-    text_color <- if (identical(theme_mode(), "dark")) "#e4e6eb" else "#172b4d"
+    # Dark Mode Logic
+    is_dark <- identical(theme_mode(), "dark")
+    text_color <- if (is_dark) "#e4e6eb" else "#172b4d"
+
+    status_colors <- c(
+      "TODO" = "#dfe1e6",       # Gray
+      "IN_PROGRESS" = "#0065ff", # Blue
+      "OVERDUE" = "#de350b",    # Red
+      "COMPLETED" = "#00875a"   # Green
+    )
 
     ggplot(status_data, aes(x = 2, y = Count, fill = Status)) +
       geom_bar(stat = "identity", width = 1) +
       coord_polar("y", start = 0) +
       xlim(c(0.5, 2.5)) +
-      theme_void() +
+      theme_void(base_size = 14) + # Increase base text size
       theme(
-        legend.position = "right",
+        text = element_text(family = "sans"), # Cleaner font
         legend.text = element_text(color = text_color),
-        legend.title = element_text(color = text_color),
+        legend.title = element_text(color = text_color, face = "bold"),
         plot.background = element_rect(fill = "transparent", color = NA),
-        panel.background = element_rect(fill = "transparent", color = NA)
+        panel.background = element_rect(fill = "transparent", color = NA),
+        legend.background = element_rect(fill = "transparent", color = NA)
       ) +
-      scale_fill_brewer(palette = "Set2")
-  })
+      scale_fill_manual(values = status_colors)
+  }, bg = "transparent", res = 96)
 
   output$priority_bar <- renderPlot({
     req(logged_in())
     tasks <- tasks_data()
     req(!is.null(tasks))
     
+    if (nrow(tasks) == 0) {
+      return(ggplot() + 
+               annotate("text", x = 1, y = 1, label = "No data available", size = 6, color = "#8993a4") + 
+               theme_void())
+    }
+    
     priority_data <- as.data.frame(table(tasks$priority))
-    colnames(priority_data) <- c("Priority", "Count")
-    priority_data$Priority <- factor(priority_data$Priority,
-                                     levels = c("LOW", "MEDIUM", "HIGH", "CRITICAL"))
+    if (ncol(priority_data) < 2) { 
+        priority_data <- data.frame(Priority = character(0), Count = integer(0))
+    } else {
+        colnames(priority_data) <- c("Priority", "Count")
+    }
 
-    text_color <- if (identical(theme_mode(), "dark")) "#e4e6eb" else "#172b4d"
+    priority_data$Priority <- factor(priority_data$Priority, levels = c("LOW", "MEDIUM", "HIGH", "CRITICAL"))
+
+    is_dark <- identical(theme_mode(), "dark")
+    text_color <- if (is_dark) "#e4e6eb" else "#172b4d"
+    grid_color <- if (is_dark) "#38414a" else "#dfe1e6"
 
     ggplot(priority_data, aes(x = Priority, y = Count, fill = Priority)) +
       geom_bar(stat = "identity") +
-      theme_minimal() +
+      theme_minimal(base_size = 14) + # Larger text base
       theme(
+        text = element_text(family = "sans", color = text_color),
         legend.position = "none",
         plot.background = element_rect(fill = "transparent", color = NA),
         panel.background = element_rect(fill = "transparent", color = NA),
         panel.grid.major.x = element_blank(),
-        text = element_text(color = text_color),
-        axis.title = element_text(color = text_color),
-        axis.text = element_text(color = text_color)
+        axis.title = element_text(color = text_color, face = "bold"),
+        axis.text = element_text(color = text_color),
+        panel.grid.major.y = element_line(color = grid_color),
+        panel.grid.minor.y = element_blank()
       ) +
       scale_fill_manual(values = c("LOW" = "#28a745", "MEDIUM" = "#ffc107",
                                    "HIGH" = "#fd7e14", "CRITICAL" = "#dc3545"))
-  })
+  }, bg = "transparent", res = 96)
   
   output$deadline_timeline <- renderPlot({
     req(logged_in())
     tasks <- tasks_data()
     req(!is.null(tasks))
     
-    upcoming <- tasks[tasks$status != "COMPLETED" & tasks$due_datetime > Sys.time(), ]
-    upcoming <- upcoming[order(upcoming$due_datetime), ]
-
-    if (nrow(upcoming) > 0) {
-      upcoming <- head(upcoming, 10)
-
-      text_color <- if (identical(theme_mode(), "dark")) "#e4e6eb" else "#172b4d"
-
-      ggplot(upcoming, aes(x = due_datetime, y = reorder(title, due_datetime))) +
-        geom_point(aes(color = priority), size = 4) +
-        geom_segment(aes(x = Sys.time(), xend = due_datetime,
-                         y = reorder(title, due_datetime),
-                         yend = reorder(title, due_datetime),
-                         color = priority)) +
-        theme_minimal() +
-        theme(
-          legend.position = "bottom",
-          plot.background = element_rect(fill = "transparent", color = NA),
-          panel.background = element_rect(fill = "transparent", color = NA),
-          text = element_text(color = text_color),
-          axis.title = element_text(color = text_color),
-          axis.text = element_text(color = text_color),
-          legend.text = element_text(color = text_color),
-          legend.title = element_text(color = text_color)
-        ) +
-        labs(x = "Due Date", y = NULL) +
-        scale_color_manual(values = c("LOW" = "#28a745", "MEDIUM" = "#ffc107",
-                                      "HIGH" = "#fd7e14", "CRITICAL" = "#dc3545"))
+    upcoming <- tasks[!is.na(tasks$due_datetime) & tasks$due_datetime > Sys.time(), ]
+    
+    if (nrow(upcoming) == 0) {
+      return(ggplot() + 
+               annotate("text", x = 1, y = 1, label = "No upcoming deadlines", size = 5, color = "#8993a4") + 
+               theme_void() +
+               theme(plot.background = element_rect(fill = "transparent", color = NA)))
     }
-  })
+
+    upcoming <- upcoming[order(upcoming$due_datetime), ]
+    upcoming <- head(upcoming, 10)
+
+    is_dark <- identical(theme_mode(), "dark")
+    text_color <- if (is_dark) "#e4e6eb" else "#172b4d"
+    grid_color <- if (is_dark) "#38414a" else "#dfe1e6"
+
+    ggplot(upcoming, aes(x = due_datetime, y = reorder(title, due_datetime))) +
+      geom_segment(aes(x = Sys.time(), xend = due_datetime,
+                       y = reorder(title, due_datetime),
+                       yend = reorder(title, due_datetime),
+                       color = priority),
+                   linewidth = 1, alpha = 0.6) +
+      geom_point(aes(color = priority, shape = status), size = 4) +
+      theme_minimal(base_size = 14) + # Larger text base
+      theme(
+        text = element_text(family = "sans", color = text_color),
+        legend.position = "bottom",
+        plot.background = element_rect(fill = "transparent", color = NA),
+        panel.background = element_rect(fill = "transparent", color = NA),
+        axis.title = element_text(color = text_color),
+        axis.text = element_text(color = text_color),
+        legend.text = element_text(color = text_color),
+        legend.title = element_text(color = text_color),
+        panel.grid.major = element_line(color = grid_color),
+        panel.grid.minor = element_blank()
+      ) +
+      labs(x = "Due Date", y = NULL, shape = "Status") +
+      scale_shape_manual(values = c("TODO" = 16, "IN_PROGRESS" = 17, "OVERDUE" = 15, "COMPLETED" = 13)) +
+      scale_color_manual(values = c("LOW" = "#28a745", "MEDIUM" = "#ffc107",
+                                    "HIGH" = "#fd7e14", "CRITICAL" = "#dc3545"))
+  }, bg = "transparent", res = 96)
   
   output$total_tasks <- renderText({
     req(logged_in())
@@ -1637,32 +2152,114 @@ server <- function(input, output, session) {
     sum(tasks$status == "OVERDUE")
   })
   
-  # Sidebar notifications
-  output$sidebar_notifications <- renderUI({
+  # 1. Render the Notification List (Inside Popover)
+  output$navbar_notifications <- renderUI({
     req(logged_in())
-    notifications <- backend_fetch_notifications(db_conn)
     
-    if (length(notifications) > 0) {
-      lapply(notifications, function(notif) {
-        is_critical <- grepl("🔴|Critical", notif)
+    fast_poll()
+
+    # Fetch from DB table (using the new function we discussed previously)
+    notifs <- backend_fetch_notifications(db_conn) 
+    
+    if (length(notifs) > 0) {
+      lapply(notifs, function(msg) {
+        # Check for keywords to style critical vs normal
+        is_critical <- grepl("🔴|Critical", msg)
         div(
           class = if (is_critical) "notification-item critical" else "notification-item",
-          notif
+          msg
         )
       })
     } else {
       div(
-        class = "empty-column",
-        style = "padding: 20px;",
-        icon("bell-slash", style = "font-size: 24px; margin-bottom: 8px; display: block;"),
-        "No notifications"
+        style = "text-align: center; color: var(--text-tertiary); padding: 20px;",
+        "No new notifications"
       )
+    }
+  })
+
+  # 2. Render the Red Dot Badge (Only if notifications exist)
+  output$notif_badge_indicator <- renderUI({
+    req(logged_in())
+
+    fast_poll()
+    notifs <- backend_fetch_notifications(db_conn)
+    
+    if (length(notifs) > 0) {
+      span(class = "notif-badge")
+    } else {
+      NULL
     }
   })
   
   observeEvent(input$clear_notifications, {
-    # REPLACE WITH REAL BACKEND: DELETE FROM notifications
-    showNotification("Notifications cleared", type = "message")
+    req(logged_in())
+
+    tryCatch({
+      backend_clear_notifications(db_conn)
+      showNotification("All notifications marked as read", type = "message")
+    }, error = function(e) {
+      showNotification("Failed to clear notifications", type = "error")
+    })
+    
+    refresh_data()
+  })
+
+  # --- DELETE LOGIC ---
+  
+  # A. Store the ID of the task we want to delete (from card or modal)
+  task_to_delete <- reactiveVal(NULL)
+
+  # 1. Trigger from CARD
+  observeEvent(input$trigger_delete_task, {
+    task_to_delete(input$trigger_delete_task)
+    show_delete_confirmation()
+  })
+
+  # 2. Trigger from MODAL
+  observeEvent(input$delete_task_modal, {
+    # We are currently in the edit modal, so we use the selected task ID
+    req(selected_task())
+    task_to_delete(selected_task()$id)
+    show_delete_confirmation()
+  })
+
+  # 3. Helper to show confirmation dialog
+  show_delete_confirmation <- function() {
+    showModal(modalDialog(
+      title = "Confirm Deletion",
+      "Are you sure you want to permanently delete this task?",
+      footer = tagList(
+        actionButton("cancel_delete", "Cancel", class = "btn-secondary"),
+        # FIX: Added 'btn-modal-delete' class here to enable the hover animation
+        actionButton("confirm_delete", "Delete Task", class = "btn-danger btn-modal-delete")
+      ),
+      size = "s" 
+    ))
+  }
+
+  # 4. Handle Confirmation Click
+  observeEvent(input$confirm_delete, {
+    req(task_to_delete())
+    
+    tryCatch({
+      backend_delete_task(db_conn, task_to_delete())
+      showNotification("Task deleted", type = "message")
+    }, error = function(e) {
+      showNotification("Failed to delete task", type = "error")
+    })
+    
+    # Cleanup
+    task_to_delete(NULL)
+    selected_task(NULL)
+    removeModal() # Closes confirmation
+    refresh_data()
+  })
+
+  # 5. Handle Cancel Click
+  observeEvent(input$cancel_delete, {
+    task_to_delete(NULL)
+    removeModal() # Just close the confirmation
   })
 }
 

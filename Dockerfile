@@ -1,36 +1,30 @@
-# Base image from Rocker (the standard for R in Docker)
+# Base image from Rocker
 FROM rocker/shiny:4.4.0
 
-# Install system dependencies
-# libmysqlclient-dev is required for the RMySQL/RMariaDB package
-# libcurl4-gnutls-dev, libssl-dev, libxml2-dev are standard R package deps
+# 1. Install System Dependencies
+# libpq-dev is for PostgreSQL
+# libsodium-dev is for Password Hashing (Sodium)
 RUN apt-get update && apt-get install -y \
-    libmysqlclient-dev \
+    libpq-dev \
     libcurl4-gnutls-dev \
     libssl-dev \
     libxml2-dev \
+    libsodium-dev \
+    zlib1g-dev \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Install renv
-ENV RENV_VERSION 1.0.7
-RUN R -e "install.packages('remotes', repos = c(CRAN = 'https://cloud.r-project.org'))"
-RUN R -e "remotes::install_version('renv', version = '$RENV_VERSION')"
+# 2. Install R Packages
+# We install these directly to ensure your app has exactly what it needs
+RUN R -e "install.packages(c('shiny', 'bslib', 'shinyWidgets', 'ggplot2', 'dplyr', 'htmltools', 'shinyjs', 'sortable', 'DBI', 'RPostgres', 'sodium', 'lubridate'), repos='https://cran.rstudio.com/')"
 
-# Create app directory
+# 3. Create app directory & Copy files
 WORKDIR /srv/shiny-server/
-
-# Copy the lock file first (for caching layers)
-COPY renv.lock .
-
-# Restore R packages (this takes time, so we want it cached)
-RUN R -e "renv::restore()"
-
-# Copy the rest of the application
 COPY . .
 
-# Expose the port Shiny runs on
+# 4. Expose the port
 EXPOSE 3838
 
-# Run the application
-CMD ["R", "-e", "shiny::runApp('/srv/shiny-server/', host = '0.0.0.0', port = 3838)"]
+# 5. Run the application
+# We use the PORT environment variable if provided by Render, otherwise 3838
+CMD ["R", "-e", "shiny::runApp('/srv/shiny-server/', host = '0.0.0.0', port = as.numeric(Sys.getenv('PORT', 3838)))"]
