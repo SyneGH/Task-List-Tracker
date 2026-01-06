@@ -20,6 +20,7 @@ library(DBI)
 # library(RMariaDB)
 library(RPostgres)
 library(sodium)
+library(pool)
 
 DEFAULT_CREDENTIALS <- list(
   username = "admin",
@@ -30,42 +31,26 @@ DEFAULT_CREDENTIALS <- list(
 # DATABASE HELPERS
 # =============================================================================
 
-db_connect <- function() {
-  # Check if we are running locally or on Render
-  # Render always sets the 'RENDER' env var to 'true'
-  is_local <- Sys.getenv("RENDER") == ""
-  
-  db_name <- Sys.getenv("DB_NAME", "task_tracker")
-  db_host <- Sys.getenv("DB_HOST", "127.0.0.1") # Default to localhost
-  db_port <- as.numeric(Sys.getenv("DB_PORT", "5432"))
-  db_user <- Sys.getenv("DB_USER", "postgres")   # Default local superuser
-  db_pass <- Sys.getenv("DB_PASSWORD", "admin123") # Default local password
-  
-  # Local Postgres usually doesn't have SSL set up, but Render REQUIRES it.
-  # "prefer" tries SSL if available, but falls back to plain text (perfect for hybrid).
-  ssl_mode <- if (is_local) "prefer" else "require"
+pool <- dbPool(
+  RPostgres::Postgres(),
+  dbname = Sys.getenv("DB_NAME", "task_tracker"),
+  host = Sys.getenv("DB_HOST", "127.0.0.1"),
+  port = as.numeric(Sys.getenv("DB_PORT", "5432")),
+  user = Sys.getenv("DB_USER", "postgres"),
+  password = Sys.getenv("DB_PASSWORD", "admin123"),
+  sslmode = if (Sys.getenv("RENDER") == "") "prefer" else "require"
+)
 
-  conn <- dbConnect(
-    RPostgres::Postgres(),
-    dbname = db_name,
-    host = db_host,
-    port = db_port,
-    user = db_user,
-    password = db_pass,
-    sslmode = ssl_mode 
-  )
+# Optional: Run initialization once on startup
+# We use tryCatch so the app doesn't crash if the table already exists
+tryCatch({
+  # Re-using your existing initialize_db function logic
+  # Note: initialize_db definition must appear BEFORE this call or be defined below. 
+  # Ideally, keep initialize_db defined below and just call the raw SQL here or 
+  # move initialize_db definition up.
+  # For simplicity, we will just rely on the server to check tables or do it here manually:
   
-  # Postgres handles timezones differently.
-  dbExecute(conn, "SET TIME ZONE 'Asia/Manila'") 
-  conn
-}
-
-initialize_db <- function(conn) {
-  # Drop tables if you need a clean slate (Be careful in production!)
-  # dbExecute(conn, "DROP TABLE IF EXISTS notifications")
-  # dbExecute(conn, "DROP TABLE IF EXISTS tasks")
-
-  dbExecute(conn, "
+  dbExecute(pool, "
     CREATE TABLE IF NOT EXISTS tasks (
       id SERIAL PRIMARY KEY,
       title VARCHAR(255) NOT NULL,
@@ -80,7 +65,7 @@ initialize_db <- function(conn) {
     )
   ")
 
-  dbExecute(conn, "
+  dbExecute(pool, "
     CREATE TABLE IF NOT EXISTS notifications (
       id SERIAL PRIMARY KEY,
       task_id INT,
@@ -90,7 +75,14 @@ initialize_db <- function(conn) {
       FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
     )
   ")
-}
+}, error = function(e) {
+  message("DB Init failed (might be connection issue): ", e$message)
+})
+
+# Ensure the pool closes when the app stops
+onStop(function() {
+  poolClose(pool)
+})
 
 format_db_time <- function(value) {
   if (is.null(value) || is.na(value)) return(NA)
@@ -1563,26 +1555,13 @@ server <- function(input, output, session) {
 
   # Initialize app state
   logged_in <- reactiveVal(FALSE)
-  db_conn <- tryCatch(
-    {
-      db_connect()
-    },
-    error = function(e) {
-      showNotification("Database connection failed. Please check credentials and network.", type = "error", duration = NULL)
-      stop(e)
-    }
-  )
-  initialize_db(db_conn)
+
+  db_conn <- pool
+  
   selected_task <- reactiveVal(NULL)
   tasks_data <- reactiveVal(NULL)
   current_view <- reactiveVal("dashboard")
   theme_mode <- reactiveVal("light")
-
-  onStop(function() {
-    if (dbIsValid(db_conn)) {
-      dbDisconnect(db_conn)
-    }
-  })
 
   # Login logic
   observeEvent(input$login_btn, {
