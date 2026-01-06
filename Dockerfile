@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     libxml2-dev \
     libsodium-dev \
     zlib1g-dev \
+    haveged \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
