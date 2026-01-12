@@ -1,0 +1,10 @@
+name: TaskListTracker
+title: TaskListTracker
+username: syne
+account: syne
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 16405887
+bundleId: 11431687
+url: https://syne.shinyapps.io/TaskListTracker/
+version: 1

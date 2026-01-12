@@ -4,8 +4,7 @@
 # Save this file as: app.R
 # 
 # Dependencies (install before running):
-# install.packages(c("shiny", "bslib", "shinyWidgets", "ggplot2", "dplyr",
-#                    "htmltools", "shinyjs", "sortable", "DBI", "RMariaDB"))
+# install.packages(c("shiny", "bslib", "shinyWidgets", "ggplot2", "dplyr", "htmltools", "shinyjs", "sortable", "DBI", "RPostgres", "sodium", "pool", "rsconnect", "lubridate"))
 # ============================================================================
 
 library(shiny)
@@ -21,6 +20,7 @@ library(DBI)
 library(RPostgres)
 library(sodium)
 library(pool)
+library(rsconnect)
 
 DEFAULT_CREDENTIALS <- list(
   username = "admin",
@@ -33,12 +33,12 @@ DEFAULT_CREDENTIALS <- list(
 
 pool <- dbPool(
   RPostgres::Postgres(),
-  dbname = Sys.getenv("DB_NAME", "task_tracker"),
-  host = Sys.getenv("DB_HOST", "127.0.0.1"),
+  dbname = Sys.getenv("DB_NAME", "postgres"),
+  host = Sys.getenv("DB_HOST", "aws-1-ap-southeast-1.pooler.supabase.com"),
   port = as.numeric(Sys.getenv("DB_PORT", "5432")),
-  user = Sys.getenv("DB_USER", "postgres"),
-  password = Sys.getenv("DB_PASSWORD", "admin123"),
-  sslmode = if (Sys.getenv("RENDER") == "") "prefer" else "require"
+  user = Sys.getenv("DB_USER", "postgres.ifujwshgwkodxrqzgyhg"),
+  password = Sys.getenv("DB_PASSWORD", "Vb2Tu6M8H$z?wUh"),
+  sslmode = "require"
 )
 
 # Optional: Run initialization once on startup
@@ -306,7 +306,7 @@ create_task_card <- function(task, ns) {
     LOW = list(bg = "#e3fcef", text = "#006644", border = "#00875a"),
     MEDIUM = list(bg = "#fff4e6", text = "#974f0c", border = "#ff991f"),
     HIGH = list(bg = "#ffebe6", text = "#bf2600", border = "#ff5630"),
-    CRITICAL = list(bg = "#ffebe6", text = "#de350b", border = "#de350b")
+    CRITICAL = list(bg = "#ffebe6", text = "#d00bde", border = "#d00bde")
   )
   
   p_style <- priority_colors[[task$priority]]
@@ -1718,7 +1718,7 @@ server <- function(input, output, session) {
           class = "kanban-header-bar",
           h2(class = "kanban-title", 
              icon("columns"),
-             "Kanban Board"
+             "Task Board"
           ),
           actionButton("create_task_btn", 
                        HTML('<i class="fa fa-plus"></i> Create Task'),
